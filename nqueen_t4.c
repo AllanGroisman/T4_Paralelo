@@ -272,7 +272,7 @@ int main(int argc, char **argv) {
 
     if (rank == 0)
         printf("Tempo total: %.4f s  (processos MPI = %d, threads/no = %d)\n",
-               t1 - t0, numProcessos, omp_get_max_threads());
+               t1 - t0, numProcessos, 8);
 
     MPI_Finalize();
     return 0;
