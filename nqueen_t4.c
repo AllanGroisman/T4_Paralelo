@@ -54,7 +54,7 @@ static inline int omp_get_max_threads(void) { return 1; }
 #define TAG_FIM       2   /* mestre -> escravo: encerrar                        */
 
 #define MAX_CHUNK   4096  /* maximo de prefixos por mensagem                    */
-#define THREADS_TRABALHO 8 /* threads OpenMP por escravo (fixo, hard-coded)     */
+#define THREADS_TRABALHO 16 /* threads OpenMP por escravo (fixo, hard-coded)    */
 
 /* === GLOBAIS === */
 int  tamanho_tabuleiro = 15;   /* N (definido por argv no main)           */

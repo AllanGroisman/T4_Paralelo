@@ -27,3 +27,4 @@ srun -N 4 -n 5 ./nqueen_exec 14 -    4,91      (1 coordenador + 4 gerenciadores 
 srun -N 4 -n 5 ./nqueen_exec 14 -     4,91     (1 coordenador + 4 gerenciadores + 16 trabalhadores) 64 - 63
 
 
+  srun -N 2 -n 3 --cpus-per-task=8 --cpu-bind=cores ./nqueen_exec 14
