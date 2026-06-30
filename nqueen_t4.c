@@ -310,6 +310,9 @@ int main(int argc, char **argv) {
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Comm_size(MPI_COMM_WORLD, &numProcessos);
 
+    meu_rank = rank;
+    gethostname(meu_host, sizeof(meu_host));
+
     if (argc > 1) tamanho_tabuleiro = atoi(argv[1]);
 
     if (numProcessos < 2) {
@@ -318,6 +321,31 @@ int main(int argc, char **argv) {
         MPI_Finalize();
         return 1;
     }
+
+    /* --- MAPA DE PROCESSOS: qual rank esta em qual computador (no) --- */
+    char *todos_hosts = NULL;
+    if (rank == 0)
+        todos_hosts = malloc((size_t)numProcessos * sizeof(meu_host));
+    MPI_Gather(meu_host, sizeof(meu_host), MPI_CHAR,
+               todos_hosts, sizeof(meu_host), MPI_CHAR, 0, MPI_COMM_WORLD);
+
+    if (rank == 0) {
+        printf("=== MAPA DE PROCESSOS MPI (threads OpenMP por processo = %d) ===\n",
+               omp_get_max_threads());
+        for (int r = 0; r < numProcessos; r++)
+            printf("  rank %d  ->  host %-12s  [%s]\n",
+                   r, &todos_hosts[r * sizeof(meu_host)],
+                   r == 0 ? "MESTRE (coordena, nao calcula)" : "ESCRAVO (calcula)");
+        printf("=================================================================\n");
+        fflush(stdout);
+        free(todos_hosts);
+    }
+
+    /* --- DIAGNOSTICO DE NUCLEOS: cada escravo mostra onde suas threads caem --- */
+    MPI_Barrier(MPI_COMM_WORLD);
+    if (rank != 0)
+        diagnostico_nucleos();
+    MPI_Barrier(MPI_COMM_WORLD);
 
     double t0 = MPI_Wtime();
 
