@@ -35,7 +35,15 @@
 #include <stdlib.h>
 #include <string.h>
 #include <mpi.h>
-#include <omp.h>
+#ifdef _OPENMP
+#include <omp.h>          /* so existe quando compilado com -fopenmp           */
+#else
+/* Fallbacks para compilar SEM -fopenmp (vira serial). Para paralelismo de
+   verdade, compile com:  mpicc -fopenmp -O2 nqueen_t4.c -o nqueens_t4        */
+static inline int omp_get_thread_num(void)  { return 0; }
+static inline int omp_get_num_threads(void) { return 1; }
+static inline int omp_get_max_threads(void) { return 1; }
+#endif
 #include <unistd.h>       /* gethostname()                                     */
 #ifdef __linux__
 #include <sched.h>        /* sched_getcpu(): em qual nucleo a thread esta      */
@@ -46,6 +54,7 @@
 #define TAG_FIM       2   /* mestre -> escravo: encerrar                        */
 
 #define MAX_CHUNK   4096  /* maximo de prefixos por mensagem                    */
+#define THREADS_TRABALHO 8 /* threads OpenMP por escravo (fixo, hard-coded)     */
 
 /* === GLOBAIS === */
 int  tamanho_tabuleiro = 15;   /* N (definido por argv no main)           */
@@ -73,7 +82,7 @@ static int nucleo_atual(void) {
  *  aparecerem no mesmo nucleo -> binding errado (estao amontoadas).
  * ============================================================ */
 void diagnostico_nucleos(void) {
-    #pragma omp parallel
+    #pragma omp parallel num_threads(THREADS_TRABALHO)
     {
         /* trabalho ficticio so para a thread ser escalonada de fato */
         volatile double x = 0.0;
@@ -81,7 +90,7 @@ void diagnostico_nucleos(void) {
         (void)x;
 
         int tid  = omp_get_thread_num();
-        int nthr = 8;
+        int nthr = omp_get_num_threads();
         int core = nucleo_atual();
 
         #pragma omp critical
@@ -141,7 +150,7 @@ long long trabalhar(const int *prefixos, int numPrefixos) {
     int reportar = !ja_reportou;
     if (reportar) ja_reportou = 1;
 
-    #pragma omp parallel for schedule(dynamic) reduction(+:total)
+    #pragma omp parallel for schedule(dynamic) reduction(+:total) num_threads(THREADS_TRABALHO)
     for (int i = 0; i < numPrefixos; i++) {
         /* cada thread imprime uma unica vez, na primeira iteracao que pegar */
         if (reportar) {
@@ -330,8 +339,8 @@ int main(int argc, char **argv) {
                todos_hosts, sizeof(meu_host), MPI_CHAR, 0, MPI_COMM_WORLD);
 
     if (rank == 0) {
-        printf("=== MAPA DE PROCESSOS MPI (threads OpenMP por processo = %d) ===\n",
-               8);
+        printf("=== MAPA DE PROCESSOS MPI (threads OpenMP por escravo = %d) ===\n",
+               THREADS_TRABALHO);
         for (int r = 0; r < numProcessos; r++)
             printf("  rank %d  ->  host %-12s  [%s]\n",
                    r, &todos_hosts[r * sizeof(meu_host)],
@@ -359,7 +368,7 @@ int main(int argc, char **argv) {
 
     if (rank == 0)
         printf("Tempo total: %.4f s  (processos MPI = %d, threads/escravo = %d)\n",
-               t1 - t0, numProcessos, 8);
+               t1 - t0, numProcessos, THREADS_TRABALHO);
 
     MPI_Finalize();
     return 0;
