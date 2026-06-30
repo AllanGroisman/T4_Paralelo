@@ -1,17 +1,33 @@
 /* ============================================================
  * N-Queens HIBRIDO  ->  MPI (mestre-escravo) + OpenMP (workpool)
  *
- * MPI  : 1 processo pesado por no. Rank 0 = coordenador (mestre),
- *        demais ranks = trabalhadores (escravos). O mestre distribui
- *        as colunas fixas das linhas 0,1,2 como tarefas.
+ * MPI   : Rank 0 = coordenador (mestre). Demais ranks = escravos.
+ *         O mestre gera todos os prefixos validos das linhas 0,1,2 e os
+ *         distribui em BLOCOS (chunks), reabastecendo cada escravo
+ *         conforme ele termina (balanceamento dinamico no nivel MPI).
  *
- * OpenMP: dentro de cada escravo, uma pool de tabuleiros parciais e
- *        consumida por todas as threads via schedule(dynamic).
- *        Sem thread mestre -> controle pela fila de iteracoes (workpool).
+ * OpenMP: cada escravo recebe um bloco de prefixos e abre UMA UNICA
+ *         regiao paralela (`omp parallel for schedule(dynamic)`) sobre
+ *         o bloco inteiro. Assim o custo de fork/join das threads e
+ *         amortizado por muitos prefixos, e o `dynamic` equilibra
+ *         subarvores de tamanhos diferentes. Sem malloc no caminho
+ *         quente, sem pool intermediaria.
  *
- * Compilar:  mpicc -fopenmp -O2 nqueens_hibrido.c -o nqueens
- * Executar:  export OMP_NUM_THREADS=<nucleos_por_no>
- *            mpirun -np 4 --map-by ppr:1:node ./nqueens 15
+ * IMPORTANTE (desempenho):
+ *   - Em maquina com 8 nucleos FISICOS (16 logicos c/ HyperThreading),
+ *     dimensione  (escravos que calculam) * OMP_NUM_THREADS ~= 8.
+ *     Ex.: -np 2  +  OMP_NUM_THREADS=8   (1 mestre ocioso + 1 escravo).
+ *   - NAO deixe o MPI prender cada rank a 1 core, senao as 8 threads
+ *     OpenMP brigam por 1 nucleo. Use binding solto ou reserve cores:
+ *       mpirun --bind-to none -np 2 ./nqueens 15
+ *       mpirun --map-by node:PE=8 --bind-to core -np 2 ./nqueens 15
+ *     e, opcionalmente:  export OMP_PROC_BIND=spread OMP_PLACES=cores
+ *   - HyperThreading nao dobra desempenho em codigo CPU-bound: meca a
+ *     eficiencia contra 8 (fisicos), nao 16.
+ *
+ * Compilar:  mpicc -fopenmp -O2 nqueen_t4.c -o nqueens
+ * Executar:  export OMP_NUM_THREADS=8
+ *            mpirun --bind-to none -np 2 ./nqueens 15
  * ============================================================ */
 
 #include <stdio.h>
@@ -20,8 +36,11 @@
 #include <mpi.h>
 #include <omp.h>
 
-#define TAG_TAREFA    0   /* mestre -> escravo: 3 ints (colunas 0,1,2)   */
-#define TAG_RESULTADO 1   /* escravo -> mestre: 1 long long (contagem)   */
+#define TAG_TAREFA    0   /* mestre -> escravo: bloco de prefixos (3 ints cada) */
+#define TAG_RESULTADO 1   /* escravo -> mestre: 1 long long (contagem)          */
+#define TAG_FIM       2   /* mestre -> escravo: encerrar                        */
+
+#define MAX_CHUNK   4096  /* maximo de prefixos por mensagem                    */
 
 /* === GLOBAIS === */
 int tamanho_tabuleiro = 15;   /* N (definido por argv no main)           */
@@ -59,91 +78,42 @@ void queen(int board_local[], int row, int n, long long *count) {
 }
 
 /* ============================================================
- *  GERACAO DA POOL (expansao sequencial barata ate a linha de corte)
+ *  FUNCAO ESCRAVO: processa um BLOCO de prefixos com UMA regiao paralela
+ *
+ *  prefixos : array plano [numPrefixos*3] com as colunas das linhas 0,1,2.
+ *  Uma unica regiao `omp parallel for schedule(dynamic)`:
+ *    - fork/join pago uma vez por bloco (e nao uma vez por tarefa);
+ *    - cada iteracao tem seu proprio tabuleiro local (sem condicao de corrida);
+ *    - `dynamic` equilibra subarvores de tamanhos diferentes;
+ *    - `reduction` soma as contagens parciais com seguranca.
  * ============================================================ */
-
-/* Conta quantos tabuleiros parciais validos existem ate linha_corte */
-void contarTarefas(int board[], int row, int linha_corte, long *total) {
-    if (row == linha_corte) { (*total)++; return; }
-    for (int col = 0; col < tamanho_tabuleiro; col++) {
-        if (place(board, row, col)) {
-            board[row] = col;
-            contarTarefas(board, row + 1, linha_corte, total);
-            board[row] = -1;
-        }
-    }
-}
-
-/* Preenche a pool (array plano) com os tabuleiros parciais validos */
-void gerarTarefas(int board[], int row, int linha_corte, int *pool, long *idx) {
-    if (row == linha_corte) {
-        memcpy(&pool[(*idx) * tamanho_tabuleiro], board,
-               sizeof(int) * tamanho_tabuleiro);
-        (*idx)++;
-        return;
-    }
-    for (int col = 0; col < tamanho_tabuleiro; col++) {
-        if (place(board, row, col)) {
-            board[row] = col;
-            gerarTarefas(board, row + 1, linha_corte, pool, idx);
-            board[row] = -1;
-        }
-    }
-}
-
-/* ============================================================
- *  FUNCAO ESCRAVO: trabalhar com WORKPOOL OpenMP (dynamic)
- * ============================================================ */
-long long trabalhar(int colunasIniciais[3]) {
+long long trabalhar(const int *prefixos, int numPrefixos) {
     int n = tamanho_tabuleiro;
+    long long total = 0;
 
-    /* Linhas 0,1,2 vem do mestre. Expandir +algumas linhas gera muitas
-       tarefas independentes -> melhor balanceamento no schedule dynamic. */
-    int linha_corte = (n > 6) ? 6 : n - 1;
+    #pragma omp parallel for schedule(dynamic) reduction(+:total)
+    for (int i = 0; i < numPrefixos; i++) {
+        int board[n];
+        memset(board, -1, sizeof(int) * n);
+        board[0] = prefixos[i * 3 + 0];
+        board[1] = prefixos[i * 3 + 1];
+        board[2] = prefixos[i * 3 + 2];
 
-    int board_base[n];
-    memset(board_base, -1, sizeof(int) * n);
-    board_base[0] = colunasIniciais[0];
-    board_base[1] = colunasIniciais[1];
-    board_base[2] = colunasIniciais[2];
-
-    /* (1) GERACAO DA POOL */
-    long total = 0;
-    contarTarefas(board_base, 3, linha_corte, &total);
-    if (total == 0) return 0;   /* configuracao inicial ja invalida */
-
-    int *pool = malloc((size_t)total * n * sizeof(int));
-    if (!pool) { fprintf(stderr, "Erro malloc pool\n"); MPI_Abort(MPI_COMM_WORLD, 1); }
-    long idx = 0;
-    gerarTarefas(board_base, 3, linha_corte, pool, &idx);
-
-    /* (2) WORKPOOL OpenMP: todas as threads consomem a pool.
-       schedule(dynamic) = cada thread pega a proxima tarefa livre,
-       sem mestre. Cada tarefa tem seu proprio board -> sem corrida.
-       reduction soma as contagens parciais com seguranca. */
-    long long solucoes_locais = 0;
-
-    #pragma omp parallel for schedule(dynamic) reduction(+:solucoes_locais)
-    for (long t = 0; t < total; t++) {
-        int board_thread[n];
-        memcpy(board_thread, &pool[(size_t)t * n], sizeof(int) * n);
         long long count = 0;
-        queen(board_thread, linha_corte, n, &count);
-        solucoes_locais += count;
+        queen(board, 3, n, &count);   /* explora a subarvore a partir da linha 3 */
+        total += count;
     }
 
-    free(pool);
-    return solucoes_locais;
+    return total;
 }
 
 /* ============================================================
  *  FUNCOES MESTRE
  * ============================================================ */
 
-/* Envia {-1,-1,-1} para o escravo encerrar */
+/* Manda o escravo encerrar (mensagem vazia com TAG_FIM) */
 void matarEscravo(int processoEscravo) {
-    int sinal_de_morte[3] = {-1, -1, -1};
-    MPI_Send(sinal_de_morte, 3, MPI_INT, processoEscravo, TAG_TAREFA, MPI_COMM_WORLD);
+    MPI_Send(NULL, 0, MPI_INT, processoEscravo, TAG_FIM, MPI_COMM_WORLD);
     escravos_vivos--;
 }
 
@@ -182,6 +152,19 @@ int* gerarTodasTarefas(long *numTarefas) {
     return tarefas;
 }
 
+/* Envia ate `chunk` prefixos a partir de `*proxima`. Retorna quantos enviou. */
+static int enviarBloco(const int *tarefas, long numTarefas, long *proxima,
+                       int chunk, int destino) {
+    long restantes = numTarefas - *proxima;
+    if (restantes <= 0) return 0;
+
+    int envia = (restantes < chunk) ? (int)restantes : chunk;
+    MPI_Send(&tarefas[(*proxima) * 3], envia * 3, MPI_INT,
+             destino, TAG_TAREFA, MPI_COMM_WORLD);
+    *proxima += envia;
+    return envia;
+}
+
 void mestre(int numProcessos) {
     long numTarefas = 0;
     int *tarefas = gerarTodasTarefas(&numTarefas);
@@ -190,14 +173,21 @@ void mestre(int numProcessos) {
     long long totalSolucoes = 0;
     long proxima = 0;
 
-    /* Distribui a primeira tarefa para cada escravo */
+    /* Tamanho do bloco: pequeno o bastante para dar varios reabastecimentos
+       por escravo (balanceamento MPI), grande o bastante para alimentar as
+       threads OpenMP. ~8 reabastecimentos por escravo, limitado a MAX_CHUNK. */
+    int chunk = (int)(numTarefas / ((long)escravos_vivos * 8));
+    if (chunk < 1)         chunk = 1;
+    if (chunk > MAX_CHUNK) chunk = MAX_CHUNK;
+
+    printf("Mestre: tabuleiro %dx%d, %d processos MPI, %d prefixos, chunk=%d\n",
+           tamanho_tabuleiro, tamanho_tabuleiro, numProcessos,
+           (int)numTarefas, chunk);
+
+    /* Rajada inicial: um bloco para cada escravo */
     for (int escravo = 1; escravo < numProcessos; escravo++) {
-        if (proxima < numTarefas) {
-            MPI_Send(&tarefas[proxima*3], 3, MPI_INT, escravo, TAG_TAREFA, MPI_COMM_WORLD);
-            proxima++;
-        } else {
+        if (enviarBloco(tarefas, numTarefas, &proxima, chunk, escravo) == 0)
             matarEscravo(escravo);   /* mais escravos que tarefas */
-        }
     }
 
     /* Laco principal: recebe resultado e reabastece o escravo */
@@ -209,12 +199,8 @@ void mestre(int numProcessos) {
         totalSolucoes += resultado;
 
         int origem = status.MPI_SOURCE;
-        if (proxima < numTarefas) {
-            MPI_Send(&tarefas[proxima*3], 3, MPI_INT, origem, TAG_TAREFA, MPI_COMM_WORLD);
-            proxima++;
-        } else {
+        if (enviarBloco(tarefas, numTarefas, &proxima, chunk, origem) == 0)
             matarEscravo(origem);
-        }
     }
 
     free(tarefas);
@@ -225,17 +211,25 @@ void mestre(int numProcessos) {
  *  LACO ESCRAVO
  * ============================================================ */
 void escravo(void) {
+    int *buf = malloc((size_t)MAX_CHUNK * 3 * sizeof(int));
+    if (!buf) { fprintf(stderr, "Erro malloc buffer escravo\n"); MPI_Abort(MPI_COMM_WORLD, 1); }
+
     while (1) {
-        int tarefa[3];
         MPI_Status status;
-        MPI_Recv(tarefa, 3, MPI_INT, 0, TAG_TAREFA, MPI_COMM_WORLD, &status);
+        MPI_Recv(buf, MAX_CHUNK * 3, MPI_INT, 0, MPI_ANY_TAG, MPI_COMM_WORLD, &status);
 
-        if (tarefa[0] == -1 && tarefa[1] == -1 && tarefa[2] == -1)
-            break;   /* sinal de morte */
+        if (status.MPI_TAG == TAG_FIM)
+            break;   /* sinal de encerramento */
 
-        long long count = trabalhar(tarefa);
+        int recebidos = 0;
+        MPI_Get_count(&status, MPI_INT, &recebidos);
+        int numPrefixos = recebidos / 3;
+
+        long long count = trabalhar(buf, numPrefixos);
         MPI_Send(&count, 1, MPI_LONG_LONG, 0, TAG_RESULTADO, MPI_COMM_WORLD);
     }
+
+    free(buf);
 }
 
 /* ============================================================
@@ -244,8 +238,8 @@ void escravo(void) {
 int main(int argc, char **argv) {
     int rank, numProcessos;
 
-    /* OpenMP dentro do MPI -> nivel de thread FUNNELED basta:
-       so a thread principal faz chamadas MPI. */
+    /* OpenMP dentro do MPI -> nivel FUNNELED basta: so a thread principal
+       faz chamadas MPI (as chamadas MPI ficam fora das regioes paralelas). */
     int provided;
     MPI_Init_thread(&argc, &argv, MPI_THREAD_FUNNELED, &provided);
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
@@ -271,8 +265,8 @@ int main(int argc, char **argv) {
     double t1 = MPI_Wtime();
 
     if (rank == 0)
-        printf("Tempo total: %.4f s  (processos MPI = %d, threads/no = %d)\n",
-               t1 - t0, numProcessos, 8);
+        printf("Tempo total: %.4f s  (processos MPI = %d, threads/escravo = %d)\n",
+               t1 - t0, numProcessos, omp_get_max_threads());
 
     MPI_Finalize();
     return 0;
