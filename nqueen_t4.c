@@ -30,11 +30,16 @@
  *            mpirun --bind-to none -np 2 ./nqueens 15
  * ============================================================ */
 
+#define _GNU_SOURCE       /* necessario para sched_getcpu() no Linux           */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <mpi.h>
 #include <omp.h>
+#include <unistd.h>       /* gethostname()                                     */
+#ifdef __linux__
+#include <sched.h>        /* sched_getcpu(): em qual nucleo a thread esta      */
+#endif
 
 #define TAG_TAREFA    0   /* mestre -> escravo: bloco de prefixos (3 ints cada) */
 #define TAG_RESULTADO 1   /* escravo -> mestre: 1 long long (contagem)          */
@@ -43,12 +48,50 @@
 #define MAX_CHUNK   4096  /* maximo de prefixos por mensagem                    */
 
 /* === GLOBAIS === */
-int tamanho_tabuleiro = 15;   /* N (definido por argv no main)           */
-int escravos_vivos    = 0;    /* controlado pelo mestre                  */
+int  tamanho_tabuleiro = 15;   /* N (definido por argv no main)           */
+int  escravos_vivos    = 0;    /* controlado pelo mestre                  */
+int  meu_rank          = 0;    /* rank MPI deste processo                 */
+char meu_host[256]     = "?";  /* nome do computador (no) deste processo  */
 
 /* === PROTOTIPOS === */
 int  place(int board_local[], int row, int col);
 void queen(int board_local[], int row, int n, long long *count);
+
+/* Em qual nucleo logico esta thread esta rodando agora (-1 se indisponivel) */
+static int nucleo_atual(void) {
+#ifdef __linux__
+    return sched_getcpu();
+#else
+    return -1;
+#endif
+}
+
+/* ============================================================
+ *  DIAGNOSTICO: mostra em quais nucleos as threads OpenMP caem.
+ *  Faz um pequeno trabalho antes de imprimir para forcar o SO a
+ *  realmente agendar cada thread num nucleo. Se TODAS as threads
+ *  aparecerem no mesmo nucleo -> binding errado (estao amontoadas).
+ * ============================================================ */
+void diagnostico_nucleos(void) {
+    #pragma omp parallel
+    {
+        /* trabalho ficticio so para a thread ser escalonada de fato */
+        volatile double x = 0.0;
+        for (int k = 0; k < 3000000; k++) x += k * 0.5;
+        (void)x;
+
+        int tid  = omp_get_thread_num();
+        int nthr = omp_get_num_threads();
+        int core = nucleo_atual();
+
+        #pragma omp critical
+        {
+            printf("[NUCLEOS] host=%-12s rank=%d  thread %d de %d  -> nucleo logico %d\n",
+                   meu_host, meu_rank, tid, nthr, core);
+            fflush(stdout);
+        }
+    }
+}
 
 /* ============================================================
  *  FUNCOES NQUEENS (nucleo recursivo)
@@ -91,8 +134,30 @@ long long trabalhar(const int *prefixos, int numPrefixos) {
     int n = tamanho_tabuleiro;
     long long total = 0;
 
+    /* So no PRIMEIRO bloco processado: cada thread reporta uma vez em qual
+       nucleo ela esta calculando de verdade. Evita poluir a saida nos blocos
+       seguintes. */
+    static int ja_reportou = 0;
+    int reportar = !ja_reportou;
+    if (reportar) ja_reportou = 1;
+
     #pragma omp parallel for schedule(dynamic) reduction(+:total)
     for (int i = 0; i < numPrefixos; i++) {
+        /* cada thread imprime uma unica vez, na primeira iteracao que pegar */
+        if (reportar) {
+            static int impresso[256] = {0};   /* indexado por id de thread */
+            int tid = omp_get_thread_num();
+            if (tid < 256 && !impresso[tid]) {
+                impresso[tid] = 1;
+                #pragma omp critical
+                {
+                    printf("[TRABALHO] host=%-12s rank=%d  thread %d  calculando no nucleo logico %d\n",
+                           meu_host, meu_rank, tid, nucleo_atual());
+                    fflush(stdout);
+                }
+            }
+        }
+
         int board[n];
         memset(board, -1, sizeof(int) * n);
         board[0] = prefixos[i * 3 + 0];
