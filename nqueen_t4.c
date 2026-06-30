@@ -81,7 +81,7 @@ void diagnostico_nucleos(void) {
         (void)x;
 
         int tid  = omp_get_thread_num();
-        int nthr = omp_get_num_threads();
+        int nthr = 8;
         int core = nucleo_atual();
 
         #pragma omp critical
@@ -331,7 +331,7 @@ int main(int argc, char **argv) {
 
     if (rank == 0) {
         printf("=== MAPA DE PROCESSOS MPI (threads OpenMP por processo = %d) ===\n",
-               omp_get_max_threads());
+               8);
         for (int r = 0; r < numProcessos; r++)
             printf("  rank %d  ->  host %-12s  [%s]\n",
                    r, &todos_hosts[r * sizeof(meu_host)],
